@@ -119,6 +119,110 @@ def _parse_openvx(buffer: bytes) -> Dict:
     return {"name": name, "version_major": major, "nodes": nodes}
 
 
+def _parse_flatbuffers(buffer: bytes) -> Dict:
+    data = memoryview(buffer)
+
+    def read_u32(offset: int) -> int:
+        return struct.unpack_from("<I", data, offset)[0]
+
+    def read_u16(offset: int) -> int:
+        return struct.unpack_from("<H", data, offset)[0]
+
+    def field_offset(table: int, index: int) -> int:
+        vtable = table - read_u32(table)
+        vlen = read_u16(vtable)
+        entry = vtable + 4 + index * 2
+        if entry >= vtable + vlen:
+            return 0
+        return read_u16(entry)
+
+    def field_uoffset(table: int, index: int) -> int | None:
+        off = field_offset(table, index)
+        if off == 0:
+            return None
+        return table + off
+
+    def read_string(uoffset: int) -> str:
+        base = uoffset + read_u32(uoffset)
+        strlen = read_u32(base)
+        start = base + 4
+        return bytes(data[start : start + strlen]).decode("utf-8", errors="ignore")
+
+    def read_vector(uoffset: int) -> Tuple[int, int]:
+        base = uoffset + read_u32(uoffset)
+        length = read_u32(base)
+        return base + 4, length
+
+    def read_vector_ints(uoffset: int) -> List[int]:
+        start, length = read_vector(uoffset)
+        return list(struct.unpack_from(f"<{length}i", data, start)) if length else []
+
+    root = read_u32(0)
+    if buffer[4:8] != b"RKNN":
+        raise ValueError("FlatBuffers RKNN block missing identifier.")
+
+    model_table = root
+    graphs_vec = field_uoffset(model_table, 2)
+    graphs: List[Dict] = []
+    tensors: List[Dict] = []
+    nodes: List[Dict] = []
+    if graphs_vec is not None:
+        start, length = read_vector(graphs_vec)
+        for i in range(length):
+            graph_offset = start + i * 4
+            graph_table = graph_offset + read_u32(graph_offset)
+            graph_tensors: List[Dict] = []
+            graph_nodes: List[Dict] = []
+            tensor_vec = field_uoffset(graph_table, 0)
+            if tensor_vec is not None:
+                t_start, t_len = read_vector(tensor_vec)
+                for j in range(t_len):
+                    tensor_off = t_start + j * 4
+                    tensor_table = tensor_off + read_u32(tensor_off)
+                    tensor_name = "tensor" + str(j)
+                    name_offset = field_uoffset(tensor_table, 5)
+                    if name_offset is not None:
+                        tensor_name = read_string(name_offset)
+                    shape_offset = field_uoffset(tensor_table, 4)
+                    shape = read_vector_ints(shape_offset) if shape_offset is not None else []
+                    index_offset = field_uoffset(tensor_table, 18)
+                    tensor_index = j
+                    if index_offset is not None:
+                        tensor_index = struct.unpack_from("<i", data, index_offset + read_u32(index_offset))[0]
+                    tensor_entry = {"index": tensor_index, "name": tensor_name, "shape": shape}
+                    tensors.append(tensor_entry)
+                    graph_tensors.append(tensor_entry)
+            node_vec = field_uoffset(graph_table, 1)
+            if node_vec is not None:
+                n_start, n_len = read_vector(node_vec)
+                for j in range(n_len):
+                    node_off = n_start + j * 4
+                    node_table = node_off + read_u32(node_off)
+                    node_type = ""
+                    type_offset = field_uoffset(node_table, 1)
+                    if type_offset is not None:
+                        node_type = read_string(type_offset)
+                    node_name = f"node{j}"
+                    name_offset = field_uoffset(node_table, 2)
+                    if name_offset is not None:
+                        node_name = read_string(name_offset)
+                    inputs_offset = field_uoffset(node_table, 4)
+                    outputs_offset = field_uoffset(node_table, 5)
+                    inputs = read_vector_ints(inputs_offset) if inputs_offset is not None else []
+                    outputs = read_vector_ints(outputs_offset) if outputs_offset is not None else []
+                    node_entry = {
+                        "type": node_type,
+                        "name": node_name,
+                        "inputs": inputs,
+                        "outputs": outputs,
+                    }
+                    nodes.append(node_entry)
+                    graph_nodes.append(node_entry)
+            graphs.append({"tensors": graph_tensors, "nodes": graph_nodes})
+
+    return {"graphs": graphs, "tensors": tensors, "nodes": nodes}
+
+
 def _describe_json_model(model: Dict, container_entries: Dict[str, bytes]) -> None:
     _normalize_node_connections(model)
     print("Model metadata")
@@ -197,7 +301,28 @@ def _describe_json_model(model: Dict, container_entries: Dict[str, bytes]) -> No
                     )
             elif "flatbuffers" in container_entries:
                 print("  expanded (flatbuffers):")
-                print("    - embedded FlatBuffers graph present (node details not decoded in this script).")
+                fb = _parse_flatbuffers(container_entries["flatbuffers"])
+                tensors = {t.get("index", i): t for i, t in enumerate(fb.get("tensors", []))}
+                for sub_index, sub_node in enumerate(fb.get("nodes", [])):
+                    print(f"    - [{sub_index:02d}] {sub_node.get('name', '')} ({sub_node.get('type', '')})")
+                    if sub_node.get("inputs"):
+                        print("       inputs:")
+                        for tidx in sub_node["inputs"]:
+                            tensor = tensors.get(tidx)
+                            if tensor:
+                                shape = "x".join(str(x) for x in tensor.get("shape", []))
+                                print(f"         - {tensor.get('name', 'tensor'+str(tidx))} [{shape}]")
+                            else:
+                                print(f"         - tensor{tidx}")
+                    if sub_node.get("outputs"):
+                        print("       outputs:")
+                        for tidx in sub_node["outputs"]:
+                            tensor = tensors.get(tidx)
+                            if tensor:
+                                shape = "x".join(str(x) for x in tensor.get("shape", []))
+                                print(f"         - {tensor.get('name', 'tensor'+str(tidx))} [{shape}]")
+                            else:
+                                print(f"         - tensor{tidx}")
             else:
                 print("  expanded: no nested graph data found in container.")
         print()
