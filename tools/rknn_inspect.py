@@ -1,8 +1,8 @@
 """Small RKNN inspection helper.
 
 This script reads an RKNN container (or plain RKNN JSON) and prints a concise
-summary of its contents, including model metadata, graph inputs / outputs, and
-per-node wiring.
+summary of its contents, including model metadata, graph inputs / outputs,
+per-node wiring, and nested graphs when present.
 """
 
 import argparse
@@ -68,7 +68,58 @@ def _connection_target(connection: Dict) -> str:
     return "?"
 
 
-def _describe_json_model(model: Dict) -> None:
+def _parse_openvx(buffer: bytes) -> Dict:
+    reader = io.BytesIO(buffer)
+
+    def _read_uint16() -> int:
+        data = reader.read(2)
+        if len(data) != 2:
+            raise ValueError("Unexpected EOF in OpenVX header.")
+        return struct.unpack("<H", data)[0]
+
+    def _read_uint32() -> int:
+        data = reader.read(4)
+        if len(data) != 4:
+            raise ValueError("Unexpected EOF in OpenVX header.")
+        return struct.unpack("<I", data)[0]
+
+    reader.seek(4)  # signature
+    major = _read_uint16()
+    _ = _read_uint16()  # minor
+    reader.seek(reader.tell() + 4)
+    name = reader.read(64).split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+    node_count = _read_uint32()
+    if major > 3:
+        reader.seek(reader.tell() + 296)
+    elif major > 1:
+        reader.seek(reader.tell() + 288)
+    else:
+        reader.seek(reader.tell() + 32)
+
+    _ = _read_uint32()  # inputOffset
+    _ = _read_uint32()  # inputSize
+    _ = _read_uint32()  # outputOffset
+    _ = _read_uint32()  # outputSize
+    node_offset = _read_uint32()
+    _ = _read_uint32()  # nodeSize
+
+    reader.seek(node_offset)
+    nodes: List[Dict[str, object]] = []
+    for _ in range(node_count):
+        type_bytes = reader.read(64)
+        node_type = type_bytes.split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+        index = _read_uint32()
+        c_val = _read_uint32()
+        d_val = _read_uint32() if major > 3 else None
+        node: Dict[str, object] = {"type": node_type, "index": index, "c": c_val}
+        if d_val is not None:
+            node["d"] = d_val
+        nodes.append(node)
+
+    return {"name": name, "version_major": major, "nodes": nodes}
+
+
+def _describe_json_model(model: Dict, container_entries: Dict[str, bytes]) -> None:
     _normalize_node_connections(model)
     print("Model metadata")
     print("==============")
@@ -130,21 +181,40 @@ def _describe_json_model(model: Dict) -> None:
             for block_name, params in attributes.items():
                 for attr_name, value in params.items():
                     print(f"    - {block_name}.{attr_name}: {value}")
+        if op_type in {"VSI_NN_OP_NBG", "RKNN_OP_NNBG"}:
+            if "openvx" in container_entries:
+                print("  expanded (openvx):")
+                subgraph = _parse_openvx(container_entries["openvx"])
+                for sub_index, sub_node in enumerate(subgraph.get("nodes", [])):
+                    print(
+                        "    - [{:02d}] {:20s} idx={} c={}{}".format(
+                            sub_index,
+                            sub_node.get("type", ""),
+                            sub_node.get("index", "-"),
+                            sub_node.get("c", "-"),
+                            f" d={sub_node.get('d')}" if "d" in sub_node else "",
+                        )
+                    )
+            elif "flatbuffers" in container_entries:
+                print("  expanded (flatbuffers):")
+                print("    - embedded FlatBuffers graph present (node details not decoded in this script).")
+            else:
+                print("  expanded: no nested graph data found in container.")
         print()
 
 
-def _parse_container(buffer: bytes) -> Tuple[str | None, Dict[str, bytes]]:
+def _parse_container(buffer: bytes) -> Tuple[str | None, Dict[str, bytes], Dict[str, int]]:
     signature = _detect_signature(buffer)
     if not signature:
         try:
             json.loads(buffer.decode("utf-8"))
-            return "json", {"json": buffer}
+            return "json", {"json": buffer}, {}
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return None, {}
+            return None, {}, {}
     if signature == "cyptrknn":
         raise ValueError("Encrypted RKNN files (CYPTRKNN) are not supported.")
     if signature in {"flatbuffers", "openvx"}:
-        return signature, {signature: buffer}
+        return signature, {signature: buffer}, {}
 
     stream = io.BytesIO(buffer)
     stream.seek(8)
@@ -160,7 +230,12 @@ def _parse_container(buffer: bytes) -> Tuple[str | None, Dict[str, bytes]]:
     entries: Dict[str, bytes] = {"json": json_block}
     if inner_signature:
         entries[inner_signature] = data_block
-    return "rknn", entries
+    container_info = {
+        "version": version,
+        "data_size": data_size,
+        "json_size": json_size,
+    }
+    return "rknn", entries, container_info
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -171,17 +246,29 @@ def main(argv: Iterable[str] | None = None) -> None:
     with open(args.path, "rb") as f:
         buffer = f.read()
 
-    signature, entries = _parse_container(buffer)
+    signature, entries, container_info = _parse_container(buffer)
     if not signature:
         raise SystemExit("Unrecognized RKNN container or JSON file.")
 
     print(f"Detected container type: {signature}")
+    if container_info:
+        version = container_info.get("version")
+        print(
+            "Container blocks: data_size={data} bytes, json_size={json} bytes, version=0x{version:x}".format(
+                data=container_info.get("data_size"),
+                json=container_info.get("json_size"),
+                version=version if version is not None else 0,
+            )
+        )
+        embedded = [name for name in entries if name != "json"]
+        if embedded:
+            print(f"Embedded binary sections: {', '.join(embedded)}")
     if "json" in entries:
         try:
             model = json.loads(entries["json"].decode("utf-8"))
         except UnicodeDecodeError as exc:
             raise SystemExit(f"Failed to decode JSON block: {exc}")
-        _describe_json_model(model)
+        _describe_json_model(model, entries)
     else:
         print("This container does not embed a JSON graph (flatbuffers/openvx only).")
 
